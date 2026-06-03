@@ -3,6 +3,20 @@
 // All paths are relative; traversal attempts are rejected at the host
 // boundary before any syscall fires.
 //
+// Isolation: each declaring cell gets its own root at
+// <storage-root>/<cell-name>. State is keyed by cell name at Register
+// time (Setup runs once with an empty CellName — see Pulp run.Main), so
+// one cell can never name, read, write, list, or delete another cell's
+// files. The per-cell root subdir is the cell name, sanitised to reject
+// path separators / "..".
+//
+// Migration: earlier builds rooted a single shared scopedFS at
+// <storage-root> itself (the union of every cell's tree). Any files
+// written under that flat layout now live OUTSIDE the new per-cell roots
+// and are no longer visible to cells. To preserve them, move each cell's
+// files from <storage-root>/<rel> into <storage-root>/<cell-name>/<rel>
+// before deploying this version.
+//
 // Deployment:
 //
 //	import _ "github.com/BananaLabs-OSS/Pulp-ext-fs"
@@ -26,9 +40,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/tetratelabs/wazero"
@@ -36,28 +52,129 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-var fsInstance *scopedFS
+// fsManager owns per-cell *scopedFS instances. Setup runs once (cell
+// name is empty there — see Pulp run.Main) so the per-cell roots are
+// created lazily on first Register with the manifest's cell name baked
+// in. Keying by cellID is what gives tenant isolation: a cell's host
+// functions close over its own *scopedFS and can never reach a sibling's
+// root.
+type fsManager struct {
+	mu          sync.RWMutex
+	instances   map[string]*scopedFS
+	storageRoot string
+	logger      *slog.Logger
+}
+
+var manager = &fsManager{instances: map[string]*scopedFS{}}
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:     "storage.fs",
-		Setup:    setup,
-		Register: bindActive,
-		Stub:     bindStub,
+		Name:         "storage.fs",
+		Setup:        setup,
+		Register:     bindActive,
+		Stub:         bindStub,
+		TeardownCell: teardownCell,
 	})
 }
 
+// setup captures the storage root and logger. It does NOT create any
+// per-cell root — Pulp calls Setup once with an empty CellName, so doing
+// so here would create (and scope every cell to) the shared parent
+// directory. Per-cell roots are created lazily from Register() once the
+// cell identity is known.
 func setup(env ext.SetupEnv) error {
-	root := filepath.Join(env.StorageRoot, env.CellName)
-	abs, err := filepath.Abs(root)
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	manager.storageRoot = env.StorageRoot
+	manager.logger = env.Logger
+	if manager.logger == nil {
+		manager.logger = slog.Default()
+	}
+	manager.logger.Info("storage.fs setup", "storage_root", env.StorageRoot)
+	return nil
+}
+
+// sanitizeCellID rejects any cell name that would escape the storage
+// root when joined as a single path component. The loader is not
+// trusted to have validated it.
+func sanitizeCellID(cellID string) error {
+	if cellID == "" {
+		return errors.New("empty cell id")
+	}
+	if strings.ContainsRune(cellID, 0) {
+		return errors.New("null byte in cell id")
+	}
+	if cellID == "." || cellID == ".." {
+		return fmt.Errorf("invalid cell id %q", cellID)
+	}
+	if strings.ContainsAny(cellID, `/\:`) {
+		return fmt.Errorf("cell id %q contains path separator", cellID)
+	}
+	if filepath.IsAbs(cellID) {
+		return fmt.Errorf("absolute cell id %q not allowed", cellID)
+	}
+	return nil
+}
+
+// forCell returns the *scopedFS for cellID, creating its per-cell root
+// at <storage-root>/<cellID> on first use. Idempotent — returns the
+// cached instance on subsequent calls.
+func (mgr *fsManager) forCell(cellID string) (*scopedFS, error) {
+	if err := sanitizeCellID(cellID); err != nil {
+		return nil, err
+	}
+
+	mgr.mu.RLock()
+	if fs, ok := mgr.instances[cellID]; ok {
+		mgr.mu.RUnlock()
+		return fs, nil
+	}
+	mgr.mu.RUnlock()
+
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	// Re-check under the write lock — another caller may have raced us.
+	if fs, ok := mgr.instances[cellID]; ok {
+		return fs, nil
+	}
+	if mgr.storageRoot == "" {
+		return nil, fmt.Errorf("storage.fs: setup not called before register")
+	}
+	abs, err := filepath.Abs(filepath.Join(mgr.storageRoot, cellID))
 	if err != nil {
-		return fmt.Errorf("resolve root: %w", err)
+		return nil, fmt.Errorf("resolve root: %w", err)
 	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return fmt.Errorf("create root: %w", err)
+		return nil, fmt.Errorf("create root: %w", err)
 	}
-	fsInstance = &scopedFS{root: abs}
-	env.Logger.Info("storage.fs ready", "root", abs)
+	fs := &scopedFS{root: abs}
+	mgr.instances[cellID] = fs
+	if mgr.logger != nil {
+		mgr.logger.Info("storage.fs ready", "cell", cellID, "root", abs)
+	}
+	return fs, nil
+}
+
+func (mgr *fsManager) get(cellID string) (*scopedFS, bool) {
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	fs, ok := mgr.instances[cellID]
+	return fs, ok
+}
+
+// teardownCell drops just one cell's scoped instance during a per-cell
+// control-socket shutdown, leaving other cells untouched. The on-disk
+// files are left in place.
+func teardownCell(_ context.Context, cellID string) error {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if _, ok := manager.instances[cellID]; !ok {
+		return nil
+	}
+	delete(manager.instances, cellID)
+	if manager.logger != nil {
+		manager.logger.Info("storage.fs teardown cell", "cell", cellID)
+	}
 	return nil
 }
 
@@ -304,6 +421,11 @@ func (f *scopedFS) CreateTemp(dir, pattern string) (string, error) {
 		if err := os.MkdirAll(parent, 0o755); err != nil {
 			return "", fmt.Errorf("mkdir tmp: %w", err)
 		}
+		// Apply the same symlink containment the explicit-dir branch gets
+		// via resolve, in case an ancestor of <root>/tmp is a planted link.
+		if err := f.checkNoSymlinkEscape(parent); err != nil {
+			return "", err
+		}
 	} else {
 		abs, err := f.resolve(dir)
 		if err != nil {
@@ -330,6 +452,11 @@ func (f *scopedFS) MkdirTemp(dir, pattern string) (string, error) {
 		if err := os.MkdirAll(parent, 0o755); err != nil {
 			return "", fmt.Errorf("mkdir tmp: %w", err)
 		}
+		// Apply the same symlink containment the explicit-dir branch gets
+		// via resolve, in case an ancestor of <root>/tmp is a planted link.
+		if err := f.checkNoSymlinkEscape(parent); err != nil {
+			return "", err
+		}
 	} else {
 		abs, err := f.resolve(dir)
 		if err != nil {
@@ -346,18 +473,59 @@ func (f *scopedFS) MkdirTemp(dir, pattern string) (string, error) {
 
 // ---- capability binding ----------------------------------------------------
 
-func bindActive(b wazero.HostModuleBuilder, _ ext.Cell) error {
-	b.NewFunctionBuilder().WithFunc(fsRead).Export("fs_read")
-	b.NewFunctionBuilder().WithFunc(fsWrite).Export("fs_write")
-	b.NewFunctionBuilder().WithFunc(fsDelete).Export("fs_delete")
-	b.NewFunctionBuilder().WithFunc(fsList).Export("fs_list")
-	b.NewFunctionBuilder().WithFunc(fsStat).Export("fs_stat")
-	b.NewFunctionBuilder().WithFunc(fsRename).Export("fs_rename")
-	b.NewFunctionBuilder().WithFunc(fsRemoveAll).Export("fs_remove_all")
-	b.NewFunctionBuilder().WithFunc(fsMkdirAll).Export("fs_mkdir_all")
-	b.NewFunctionBuilder().WithFunc(fsChmod).Export("fs_chmod")
-	b.NewFunctionBuilder().WithFunc(fsCreateTemp).Export("fs_create_temp")
-	b.NewFunctionBuilder().WithFunc(fsMkdirTemp).Export("fs_mkdir_temp")
+func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	cellID := cell.Name()
+	// Create the per-cell root eagerly so a bad cell name / storage root
+	// fails at cell load, not on the first op. Errors abort registration.
+	if _, err := manager.forCell(cellID); err != nil {
+		return fmt.Errorf("scope storage.fs for cell %q: %w", cellID, err)
+	}
+
+	read := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
+		return fsRead(ctx, m, cellID, p1, p2, p3, p4)
+	}
+	write := func(ctx context.Context, m api.Module, p1, p2, p3, p4, p5, p6 uint32) uint32 {
+		return fsWrite(ctx, m, cellID, p1, p2, p3, p4, p5, p6)
+	}
+	del := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
+		return fsDelete(ctx, m, cellID, p1, p2)
+	}
+	list := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
+		return fsList(ctx, m, cellID, p1, p2, p3, p4)
+	}
+	stat := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
+		return fsStat(ctx, m, cellID, p1, p2, p3, p4)
+	}
+	rename := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
+		return fsRename(ctx, m, cellID, p1, p2)
+	}
+	removeAll := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
+		return fsRemoveAll(ctx, m, cellID, p1, p2)
+	}
+	mkdirAll := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
+		return fsMkdirAll(ctx, m, cellID, p1, p2)
+	}
+	chmod := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
+		return fsChmod(ctx, m, cellID, p1, p2)
+	}
+	createTemp := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
+		return fsCreateTemp(ctx, m, cellID, p1, p2, p3, p4)
+	}
+	mkdirTemp := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
+		return fsMkdirTemp(ctx, m, cellID, p1, p2, p3, p4)
+	}
+
+	b.NewFunctionBuilder().WithFunc(read).Export("fs_read")
+	b.NewFunctionBuilder().WithFunc(write).Export("fs_write")
+	b.NewFunctionBuilder().WithFunc(del).Export("fs_delete")
+	b.NewFunctionBuilder().WithFunc(list).Export("fs_list")
+	b.NewFunctionBuilder().WithFunc(stat).Export("fs_stat")
+	b.NewFunctionBuilder().WithFunc(rename).Export("fs_rename")
+	b.NewFunctionBuilder().WithFunc(removeAll).Export("fs_remove_all")
+	b.NewFunctionBuilder().WithFunc(mkdirAll).Export("fs_mkdir_all")
+	b.NewFunctionBuilder().WithFunc(chmod).Export("fs_chmod")
+	b.NewFunctionBuilder().WithFunc(createTemp).Export("fs_create_temp")
+	b.NewFunctionBuilder().WithFunc(mkdirTemp).Export("fs_mkdir_temp")
 	return nil
 }
 
@@ -381,7 +549,14 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 
 // ---- handlers --------------------------------------------------------------
 
-func fsRead(ctx context.Context, m api.Module, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
+// cellFS returns the per-cell scoped instance, or false if the cell was
+// never registered (or was torn down). Handlers return code 9 in that
+// case, mirroring the sqlite ext's "no handle" path.
+func cellFS(cellID string) (*scopedFS, bool) {
+	return manager.get(cellID)
+}
+
+func fsRead(ctx context.Context, m api.Module, cellID string, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -389,7 +564,11 @@ func fsRead(ctx context.Context, m api.Module, pathPtr, pathLen, dataPtrOut, dat
 	if !ok {
 		return 2
 	}
-	content, err := fsInstance.Read(string(pathData))
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	content, err := fs.Read(string(pathData))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 6
@@ -401,7 +580,7 @@ func fsRead(ctx context.Context, m api.Module, pathPtr, pathLen, dataPtrOut, dat
 
 // fsWrite now takes six args: path_ptr, path_len, data_ptr, data_len, req_ptr, req_len.
 // The req buffer carries optional mode via msgpack; absent/zero defaults to 0o644.
-func fsWrite(_ context.Context, m api.Module, pathPtr, pathLen, dataPtr, dataLen, reqPtr, reqLen uint32) uint32 {
+func fsWrite(_ context.Context, m api.Module, cellID string, pathPtr, pathLen, dataPtr, dataLen, reqPtr, reqLen uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -430,13 +609,17 @@ func fsWrite(_ context.Context, m api.Module, pathPtr, pathLen, dataPtr, dataLen
 			mode = os.FileMode(req.Mode)
 		}
 	}
-	if err := fsInstance.Write(string(pathData), content, mode); err != nil {
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	if err := fs.Write(string(pathData), content, mode); err != nil {
 		return pathErrCode(err)
 	}
 	return 0
 }
 
-func fsDelete(_ context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
+func fsDelete(_ context.Context, m api.Module, cellID string, pathPtr, pathLen uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -444,7 +627,11 @@ func fsDelete(_ context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
 	if !ok {
 		return 2
 	}
-	if err := fsInstance.Delete(string(pathData)); err != nil {
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	if err := fs.Delete(string(pathData)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 6
 		}
@@ -453,7 +640,7 @@ func fsDelete(_ context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
 	return 0
 }
 
-func fsList(ctx context.Context, m api.Module, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsList(ctx context.Context, m api.Module, cellID string, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -461,7 +648,11 @@ func fsList(ctx context.Context, m api.Module, pathPtr, pathLen, dataPtrOut, dat
 	if !ok {
 		return 2
 	}
-	entries, err := fsInstance.List(string(pathData))
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	entries, err := fs.List(string(pathData))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 6
@@ -475,7 +666,7 @@ func fsList(ctx context.Context, m api.Module, pathPtr, pathLen, dataPtrOut, dat
 	return writeResponse(ctx, m, encoded, dataPtrOut, dataLenOut)
 }
 
-func fsStat(ctx context.Context, m api.Module, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsStat(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -487,7 +678,11 @@ func fsStat(ctx context.Context, m api.Module, reqPtr, reqLen, dataPtrOut, dataL
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	info, err := fsInstance.Stat(req.Path)
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	info, err := fs.Stat(req.Path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 6
@@ -501,7 +696,7 @@ func fsStat(ctx context.Context, m api.Module, reqPtr, reqLen, dataPtrOut, dataL
 	return writeResponse(ctx, m, encoded, dataPtrOut, dataLenOut)
 }
 
-func fsRename(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func fsRename(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -513,7 +708,11 @@ func fsRename(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	if err := fsInstance.Rename(req.Old, req.New); err != nil {
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	if err := fs.Rename(req.Old, req.New); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 6
 		}
@@ -522,7 +721,7 @@ func fsRename(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	return 0
 }
 
-func fsRemoveAll(_ context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
+func fsRemoveAll(_ context.Context, m api.Module, cellID string, pathPtr, pathLen uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -530,13 +729,17 @@ func fsRemoveAll(_ context.Context, m api.Module, pathPtr, pathLen uint32) uint3
 	if !ok {
 		return 2
 	}
-	if err := fsInstance.RemoveAll(string(pathData)); err != nil {
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	if err := fs.RemoveAll(string(pathData)); err != nil {
 		return pathErrCode(err)
 	}
 	return 0
 }
 
-func fsMkdirAll(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func fsMkdirAll(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -552,13 +755,17 @@ func fsMkdirAll(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if req.Mode != 0 {
 		mode = os.FileMode(req.Mode)
 	}
-	if err := fsInstance.MkdirAll(req.Path, mode); err != nil {
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	if err := fs.MkdirAll(req.Path, mode); err != nil {
 		return pathErrCode(err)
 	}
 	return 0
 }
 
-func fsChmod(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func fsChmod(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -570,7 +777,11 @@ func fsChmod(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	if err := fsInstance.Chmod(req.Path, os.FileMode(req.Mode)); err != nil {
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	if err := fs.Chmod(req.Path, os.FileMode(req.Mode)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 6
 		}
@@ -579,7 +790,7 @@ func fsChmod(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	return 0
 }
 
-func fsCreateTemp(ctx context.Context, m api.Module, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsCreateTemp(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -591,7 +802,11 @@ func fsCreateTemp(ctx context.Context, m api.Module, reqPtr, reqLen, dataPtrOut,
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	rel, err := fsInstance.CreateTemp(req.Dir, req.Pattern)
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	rel, err := fs.CreateTemp(req.Dir, req.Pattern)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 6
@@ -605,7 +820,7 @@ func fsCreateTemp(ctx context.Context, m api.Module, reqPtr, reqLen, dataPtrOut,
 	return writeResponse(ctx, m, encoded, dataPtrOut, dataLenOut)
 }
 
-func fsMkdirTemp(ctx context.Context, m api.Module, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsMkdirTemp(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -617,7 +832,11 @@ func fsMkdirTemp(ctx context.Context, m api.Module, reqPtr, reqLen, dataPtrOut, 
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	rel, err := fsInstance.MkdirTemp(req.Dir, req.Pattern)
+	fs, ok := cellFS(cellID)
+	if !ok {
+		return 9
+	}
+	rel, err := fs.MkdirTemp(req.Dir, req.Pattern)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 6
