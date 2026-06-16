@@ -116,6 +116,28 @@ func sanitizeCellID(cellID string) error {
 	return nil
 }
 
+// fsRootOverride returns an absolute directory to use as cellID's storage.fs
+// scope, from PULP_FS_ROOT_<CELLID> (cell id upper-cased, non-alphanumerics →
+// "_"), or "" if unset. This is how the workbench cell is pointed at a real
+// project: the host runs with the chosen repo as the cell's fs root.
+func fsRootOverride(cellID string) string {
+	return strings.TrimSpace(os.Getenv("PULP_FS_ROOT_" + envKey(cellID)))
+}
+
+// envKey maps a cell id to an env-var-safe token: upper-cased, with every
+// non-alphanumeric rune replaced by "_".
+func envKey(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(s) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
 // forCell returns the *scopedFS for cellID, creating its per-cell root
 // at <storage-root>/<cellID> on first use. Idempotent — returns the
 // cached instance on subsequent calls.
@@ -140,7 +162,15 @@ func (mgr *fsManager) forCell(cellID string) (*scopedFS, error) {
 	if mgr.storageRoot == "" {
 		return nil, fmt.Errorf("storage.fs: setup not called before register")
 	}
-	abs, err := filepath.Abs(filepath.Join(mgr.storageRoot, cellID))
+	// A deployment can aim a specific cell's fs scope at an arbitrary directory
+	// (e.g. the repo under edit) via PULP_FS_ROOT_<CELLID>, instead of the
+	// default per-cell storage subdir. The cell's private store (ext-sqlite)
+	// is unaffected — it stays under the storage root.
+	rootPath := filepath.Join(mgr.storageRoot, cellID)
+	if ov := fsRootOverride(cellID); ov != "" {
+		rootPath = ov
+	}
+	abs, err := filepath.Abs(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root: %w", err)
 	}
@@ -240,7 +270,12 @@ func (f *scopedFS) resolve(rel string) (string, error) {
 		return "", fmt.Errorf("absolute path %q not allowed", rel)
 	}
 	clean := filepath.Clean(filepath.Join(f.root, rel))
-	rootWithSep := f.root + string(filepath.Separator)
+	// A drive/filesystem root (e.g. "C:\\" or "/") already ends in a separator;
+	// don't append another or the prefix check would compare against "C:\\\\".
+	rootWithSep := f.root
+	if !strings.HasSuffix(rootWithSep, string(filepath.Separator)) {
+		rootWithSep += string(filepath.Separator)
+	}
 	if clean != f.root && !strings.HasPrefix(clean+string(filepath.Separator), rootWithSep) {
 		return "", fmt.Errorf("path %q escapes root", rel)
 	}
