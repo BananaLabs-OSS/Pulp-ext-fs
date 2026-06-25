@@ -418,6 +418,14 @@ func (f *scopedFS) RemoveAll(rel string) error {
 	if err != nil {
 		return err
 	}
+	// B5: guard against nuking the entire storage root in one call.
+	// resolve permits "." / root-equivalent paths (clean(root+"/.")== root),
+	// but RemoveAll on the root would destroy the cell's whole tree.
+	// Individual file/subdir deletes are still allowed — only the root
+	// itself is rejected.
+	if abs == f.root {
+		return fmt.Errorf("RemoveAll %q: cannot remove the storage root", rel)
+	}
 	return os.RemoveAll(abs)
 }
 

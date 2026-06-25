@@ -105,6 +105,42 @@ func TestCellCannotReachSiblingPath(t *testing.T) {
 	}
 }
 
+// TestRemoveAllRootGuard verifies that RemoveAll(".")/root-equivalent paths
+// are rejected so a cell cannot nuke its entire storage root (audit B5).
+func TestRemoveAllRootGuard(t *testing.T) {
+	mgr := newManager(t)
+	fs, err := mgr.forCell("alpha")
+	if err != nil {
+		t.Fatalf("forCell: %v", err)
+	}
+
+	// Write a file so the root is non-empty; the guard should fire before
+	// any filesystem mutation.
+	if err := fs.Write("canary.txt", []byte("alive"), 0o644); err != nil {
+		t.Fatalf("write canary: %v", err)
+	}
+
+	rootEquiv := []string{".", "./", "./."}
+	for _, p := range rootEquiv {
+		if err := fs.RemoveAll(p); err == nil {
+			t.Errorf("RemoveAll(%q) succeeded; expected root-guard rejection", p)
+		}
+	}
+
+	// Canary must still exist — no deletion should have occurred.
+	if _, err := fs.Read("canary.txt"); err != nil {
+		t.Fatalf("canary.txt missing after root-guard test: %v", err)
+	}
+
+	// Subdirectory deletes must still work.
+	if err := fs.MkdirAll("subdir", 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	if err := fs.RemoveAll("subdir"); err != nil {
+		t.Fatalf("RemoveAll(subdir) failed: %v", err)
+	}
+}
+
 // TestManagerScopesByCellID confirms forCell is idempotent per cell and
 // that get() only returns a registered cell.
 func TestManagerScopesByCellID(t *testing.T) {
