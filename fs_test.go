@@ -1,22 +1,35 @@
 package fsext
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/BananaLabs-OSS/Pulp/ext"
 )
 
 // newManager returns a fresh fsManager rooted at a temp storage dir, so
 // tests don't share the package-global instance.
 func newManager(t *testing.T) *fsManager {
 	t.Helper()
-	return &fsManager{
-		instances:   map[string]*scopedFS{},
-		storageRoot: t.TempDir(),
-		logger:      slog.Default(),
+	mgr := newFSManager()
+	mgr.storageRoot = t.TempDir()
+	mgr.logger = slog.Default()
+	return mgr
+}
+
+func testScope(t *testing.T, app, appInstance, cell, cellInstance string) ext.Scope {
+	t.Helper()
+	scope, err := ext.NewScope(app, appInstance, cell, cellInstance)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return scope
 }
 
 // TestCellCannotReachSiblingPath is the core tenant-isolation guarantee:
@@ -189,5 +202,125 @@ func TestSanitizeCellID(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(mgr.storageRoot, "..", "escape")); err == nil {
 		t.Fatalf("forCell created a directory outside the storage root")
+	}
+}
+
+func TestTwoApplicationScopeLifecycle(t *testing.T) {
+	mgr := newManager(t)
+	evolutionHost := testScope(t, "evolution", "blue", "host", "primary")
+	sessionsHost := testScope(t, "sessions", "green", "host", "primary")
+	evolutionRoot := filepath.Join(mgr.storageRoot, "evolution-store", "blue")
+	sessionsRoot := filepath.Join(mgr.storageRoot, "sessions-store", "green")
+	if err := mgr.setup(ext.SetupEnv{Scope: evolutionHost, StorageRoot: evolutionRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.setup(ext.SetupEnv{Scope: sessionsHost, StorageRoot: sessionsRoot}); err != nil {
+		t.Fatal(err)
+	}
+	evolution := testScope(t, "evolution", "blue", "storage", "primary")
+	sessions := testScope(t, "sessions", "green", "storage", "primary")
+	left, err := mgr.forScope(evolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := mgr.forScope(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left == right || left.root == right.root {
+		t.Fatal("two applications share mutable filesystem state")
+	}
+	if err := left.Write("owner.txt", []byte("evolution"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := right.Read("owner.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Sessions observed Evolution state: %v", err)
+	}
+	if err := mgr.teardownScope(evolutionHost); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mgr.getScope(evolution); ok {
+		t.Fatal("Evolution instance survived scoped teardown")
+	}
+	if _, ok := mgr.getScope(sessions); !ok {
+		t.Fatal("Evolution teardown removed Sessions")
+	}
+	if err := mgr.teardownScope(evolutionHost); err != nil {
+		t.Fatalf("repeated teardown is not idempotent: %v", err)
+	}
+	if err := mgr.setup(ext.SetupEnv{Scope: sessionsHost, StorageRoot: filepath.Join(mgr.storageRoot, "replacement")}); err == nil {
+		t.Fatal("live Sessions root was replaced")
+	}
+}
+
+func TestLegacyLifecycleReleasesOnlyLegacySetup(t *testing.T) {
+	mgr := newManager(t)
+	firstLegacyRoot := filepath.Join(mgr.storageRoot, "legacy-one")
+	if err := mgr.setup(ext.SetupEnv{StorageRoot: firstLegacyRoot}); err != nil {
+		t.Fatal(err)
+	}
+	sessionsHost := testScope(t, "sessions", "green", "host", "primary")
+	sessionsRoot := filepath.Join(mgr.storageRoot, "sessions")
+	if err := mgr.setup(ext.SetupEnv{Scope: sessionsHost, StorageRoot: sessionsRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.teardownScope(ext.LegacyScope("default")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.setup(ext.SetupEnv{StorageRoot: filepath.Join(mgr.storageRoot, "legacy-two")}); err != nil {
+		t.Fatalf("legacy setup lease survived teardown: %v", err)
+	}
+	if err := mgr.setup(ext.SetupEnv{Scope: sessionsHost, StorageRoot: filepath.Join(mgr.storageRoot, "wrong")}); err == nil {
+		t.Fatal("legacy teardown released a live scoped setup")
+	}
+}
+
+func TestTwoApplicationScopeRace(t *testing.T) {
+	mgr := newManager(t)
+	aHost := testScope(t, "evolution", "blue", "host", "primary")
+	bHost := testScope(t, "sessions", "green", "host", "primary")
+	aRoot := filepath.Join(mgr.storageRoot, "a")
+	bRoot := filepath.Join(mgr.storageRoot, "b")
+	aCell := testScope(t, "evolution", "blue", "storage", "primary")
+	bCell := testScope(t, "sessions", "green", "storage", "primary")
+	if err := mgr.setup(ext.SetupEnv{Scope: bHost, StorageRoot: bRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.forScope(bCell); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if err := mgr.setup(ext.SetupEnv{Scope: aHost, StorageRoot: aRoot}); err != nil {
+				errCh <- err
+				return
+			}
+			if _, err := mgr.forScope(aCell); err != nil {
+				errCh <- err
+				return
+			}
+			if err := mgr.teardownScope(aHost); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if _, ok := mgr.getScope(bCell); !ok {
+				errCh <- fmt.Errorf("Sessions disappeared during Evolution lifecycle")
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
 	}
 }

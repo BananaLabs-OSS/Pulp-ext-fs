@@ -60,20 +60,40 @@ import (
 // root.
 type fsManager struct {
 	mu          sync.RWMutex
-	instances   map[string]*scopedFS
+	instances   map[ext.ResourceKey]*scopedFS
+	setups      map[fsApplicationKey]fsSetup
 	storageRoot string
 	logger      *slog.Logger
 }
 
-var manager = &fsManager{instances: map[string]*scopedFS{}}
+type fsApplicationKey struct {
+	applicationID string
+	instanceID    string
+}
+
+type fsSetup struct {
+	storageRoot string
+	logger      *slog.Logger
+}
+
+func newFSManager() *fsManager {
+	return &fsManager{
+		instances: map[ext.ResourceKey]*scopedFS{},
+		setups:    map[fsApplicationKey]fsSetup{},
+	}
+}
+
+var manager = newFSManager()
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:         "storage.fs",
-		Setup:        setup,
-		Register:     bindActive,
-		Stub:         bindStub,
-		TeardownCell: teardownCell,
+		Name:          "storage.fs",
+		Setup:         setup,
+		Teardown:      teardown,
+		TeardownScope: teardownScope,
+		Register:      bindActive,
+		Stub:          bindStub,
+		TeardownCell:  teardownCell,
 	})
 }
 
@@ -83,15 +103,41 @@ func init() {
 // directory. Per-cell roots are created lazily from Register() once the
 // cell identity is known.
 func setup(env ext.SetupEnv) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	manager.storageRoot = env.StorageRoot
-	manager.logger = env.Logger
-	if manager.logger == nil {
-		manager.logger = slog.Default()
+	return manager.setup(env)
+}
+
+func (mgr *fsManager) setup(env ext.SetupEnv) error {
+	scope := env.EffectiveScope()
+	if err := validateScope(scope); err != nil {
+		return err
 	}
-	manager.logger.Info("storage.fs setup", "storage_root", env.StorageRoot)
+	logger := env.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	owner := fsApplicationScopeKey(scope)
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if existing, ok := mgr.setups[owner]; ok {
+		if existing.storageRoot != env.StorageRoot {
+			return fmt.Errorf("storage.fs: application %s/%s already owns storage root %q; refusing replacement with %q", owner.applicationID, owner.instanceID, existing.storageRoot, env.StorageRoot)
+		}
+		return nil
+	}
+	mgr.setups[owner] = fsSetup{storageRoot: env.StorageRoot, logger: logger}
+	if scope.IsLegacy() {
+		mgr.storageRoot = env.StorageRoot
+		mgr.logger = logger
+	}
+	if mgr.logger == nil {
+		mgr.logger = logger
+	}
+	logger.Info("storage.fs setup", "storage_root", env.StorageRoot, "application", owner.applicationID, "instance", owner.instanceID)
 	return nil
+}
+
+func fsApplicationScopeKey(scope ext.Scope) fsApplicationKey {
+	return fsApplicationKey{applicationID: scope.ApplicationID(), instanceID: scope.ApplicationInstanceID()}
 }
 
 // sanitizeCellID rejects any cell name that would escape the storage
@@ -116,12 +162,39 @@ func sanitizeCellID(cellID string) error {
 	return nil
 }
 
+func validateScope(scope ext.Scope) error {
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("storage.fs: invalid scope: %w", err)
+	}
+	for _, value := range []string{scope.ApplicationID(), scope.ApplicationInstanceID(), scope.CellID(), scope.CellInstanceID()} {
+		if err := sanitizeCellID(value); err != nil {
+			return fmt.Errorf("storage.fs: invalid scope component %q: %w", value, err)
+		}
+	}
+	return nil
+}
+
+func fsResourceKey(scope ext.Scope) (ext.ResourceKey, error) {
+	if err := validateScope(scope); err != nil {
+		return ext.ResourceKey{}, err
+	}
+	return scope.ResourceKey("storage.fs", "root")
+}
+
 // fsRootOverride returns an absolute directory to use as cellID's storage.fs
 // scope, from PULP_FS_ROOT_<CELLID> (cell id upper-cased, non-alphanumerics →
 // "_"), or "" if unset. This is how the workbench cell is pointed at a real
 // project: the host runs with the chosen repo as the cell's fs root.
 func fsRootOverride(cellID string) string {
 	return strings.TrimSpace(os.Getenv("PULP_FS_ROOT_" + envKey(cellID)))
+}
+
+func fsRootOverrideForScope(scope ext.Scope) string {
+	if scope.IsLegacy() {
+		return fsRootOverride(scope.CellID())
+	}
+	key := envKey(scope.ApplicationID() + "_" + scope.ApplicationInstanceID() + "_" + scope.CellID() + "_" + scope.CellInstanceID())
+	return strings.TrimSpace(os.Getenv("PULP_FS_ROOT_" + key))
 }
 
 // envKey maps a cell id to an env-var-safe token: upper-cased, with every
@@ -142,12 +215,17 @@ func envKey(s string) string {
 // at <storage-root>/<cellID> on first use. Idempotent — returns the
 // cached instance on subsequent calls.
 func (mgr *fsManager) forCell(cellID string) (*scopedFS, error) {
-	if err := sanitizeCellID(cellID); err != nil {
+	return mgr.forScope(ext.LegacyScope(cellID))
+}
+
+func (mgr *fsManager) forScope(scope ext.Scope) (*scopedFS, error) {
+	key, err := fsResourceKey(scope)
+	if err != nil {
 		return nil, err
 	}
 
 	mgr.mu.RLock()
-	if fs, ok := mgr.instances[cellID]; ok {
+	if fs, ok := mgr.instances[key]; ok {
 		mgr.mu.RUnlock()
 		return fs, nil
 	}
@@ -156,18 +234,28 @@ func (mgr *fsManager) forCell(cellID string) (*scopedFS, error) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	// Re-check under the write lock — another caller may have raced us.
-	if fs, ok := mgr.instances[cellID]; ok {
+	if fs, ok := mgr.instances[key]; ok {
 		return fs, nil
 	}
-	if mgr.storageRoot == "" {
+	setup, configured := mgr.setups[fsApplicationScopeKey(scope)]
+	storageRoot := mgr.storageRoot
+	logger := mgr.logger
+	if configured {
+		storageRoot = setup.storageRoot
+		logger = setup.logger
+	}
+	if storageRoot == "" {
 		return nil, fmt.Errorf("storage.fs: setup not called before register")
 	}
 	// A deployment can aim a specific cell's fs scope at an arbitrary directory
 	// (e.g. the repo under edit) via PULP_FS_ROOT_<CELLID>, instead of the
 	// default per-cell storage subdir. The cell's private store (ext-sqlite)
 	// is unaffected — it stays under the storage root.
-	rootPath := filepath.Join(mgr.storageRoot, cellID)
-	if ov := fsRootOverride(cellID); ov != "" {
+	rootPath := filepath.Join(storageRoot, scope.CellID())
+	if !scope.IsLegacy() {
+		rootPath = filepath.Join(storageRoot, "apps", scope.ApplicationID(), scope.ApplicationInstanceID(), "cells", scope.CellID(), scope.CellInstanceID())
+	}
+	if ov := fsRootOverrideForScope(scope); ov != "" {
 		rootPath = ov
 	}
 	abs, err := filepath.Abs(rootPath)
@@ -178,17 +266,25 @@ func (mgr *fsManager) forCell(cellID string) (*scopedFS, error) {
 		return nil, fmt.Errorf("create root: %w", err)
 	}
 	fs := &scopedFS{root: abs}
-	mgr.instances[cellID] = fs
-	if mgr.logger != nil {
-		mgr.logger.Info("storage.fs ready", "cell", cellID, "root", abs)
+	mgr.instances[key] = fs
+	if logger != nil {
+		logger.Info("storage.fs ready", "scope", key, "root", abs)
 	}
 	return fs, nil
 }
 
 func (mgr *fsManager) get(cellID string) (*scopedFS, bool) {
+	return mgr.getScope(ext.LegacyScope(cellID))
+}
+
+func (mgr *fsManager) getScope(scope ext.Scope) (*scopedFS, bool) {
+	key, err := fsResourceKey(scope)
+	if err != nil {
+		return nil, false
+	}
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
-	fs, ok := mgr.instances[cellID]
+	fs, ok := mgr.instances[key]
 	return fs, ok
 }
 
@@ -196,14 +292,45 @@ func (mgr *fsManager) get(cellID string) (*scopedFS, bool) {
 // control-socket shutdown, leaving other cells untouched. The on-disk
 // files are left in place.
 func teardownCell(_ context.Context, cellID string) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	if _, ok := manager.instances[cellID]; !ok {
-		return nil
+	return manager.teardownCell(cellID)
+}
+
+func (mgr *fsManager) teardownCell(cellID string) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	for key := range mgr.instances {
+		scope := key.Scope()
+		if (scope.IsLegacy() && scope.CellID() == cellID) || (!scope.IsLegacy() && scope.RoutingID() == cellID) {
+			delete(mgr.instances, key)
+			return nil
+		}
 	}
-	delete(manager.instances, cellID)
-	if manager.logger != nil {
-		manager.logger.Info("storage.fs teardown cell", "cell", cellID)
+	return nil
+}
+
+func teardownScope(_ context.Context, scope ext.Scope) error {
+	return manager.teardownScope(scope)
+}
+
+func teardown(_ context.Context) error {
+	return manager.teardownScope(ext.LegacyScope("default"))
+}
+
+func (mgr *fsManager) teardownScope(scope ext.Scope) error {
+	if err := validateScope(scope); err != nil {
+		return err
+	}
+	owner := fsApplicationScopeKey(scope)
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	for key := range mgr.instances {
+		if fsApplicationScopeKey(key.Scope()) == owner {
+			delete(mgr.instances, key)
+		}
+	}
+	delete(mgr.setups, owner)
+	if scope.IsLegacy() {
+		mgr.storageRoot = ""
 	}
 	return nil
 }
@@ -517,45 +644,48 @@ func (f *scopedFS) MkdirTemp(dir, pattern string) (string, error) {
 // ---- capability binding ----------------------------------------------------
 
 func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	scope, err := ext.ValidatedScopeOf(cell)
+	if err != nil {
+		return fmt.Errorf("storage.fs: resolve cell scope: %w", err)
+	}
 	// Create the per-cell root eagerly so a bad cell name / storage root
 	// fails at cell load, not on the first op. Errors abort registration.
-	if _, err := manager.forCell(cellID); err != nil {
-		return fmt.Errorf("scope storage.fs for cell %q: %w", cellID, err)
+	if _, err := manager.forScope(scope); err != nil {
+		return fmt.Errorf("scope storage.fs for cell %q: %w", cell.Name(), err)
 	}
 
 	read := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
-		return fsRead(ctx, m, cellID, p1, p2, p3, p4)
+		return fsRead(ctx, m, scope, p1, p2, p3, p4)
 	}
 	write := func(ctx context.Context, m api.Module, p1, p2, p3, p4, p5, p6 uint32) uint32 {
-		return fsWrite(ctx, m, cellID, p1, p2, p3, p4, p5, p6)
+		return fsWrite(ctx, m, scope, p1, p2, p3, p4, p5, p6)
 	}
 	del := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
-		return fsDelete(ctx, m, cellID, p1, p2)
+		return fsDelete(ctx, m, scope, p1, p2)
 	}
 	list := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
-		return fsList(ctx, m, cellID, p1, p2, p3, p4)
+		return fsList(ctx, m, scope, p1, p2, p3, p4)
 	}
 	stat := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
-		return fsStat(ctx, m, cellID, p1, p2, p3, p4)
+		return fsStat(ctx, m, scope, p1, p2, p3, p4)
 	}
 	rename := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
-		return fsRename(ctx, m, cellID, p1, p2)
+		return fsRename(ctx, m, scope, p1, p2)
 	}
 	removeAll := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
-		return fsRemoveAll(ctx, m, cellID, p1, p2)
+		return fsRemoveAll(ctx, m, scope, p1, p2)
 	}
 	mkdirAll := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
-		return fsMkdirAll(ctx, m, cellID, p1, p2)
+		return fsMkdirAll(ctx, m, scope, p1, p2)
 	}
 	chmod := func(ctx context.Context, m api.Module, p1, p2 uint32) uint32 {
-		return fsChmod(ctx, m, cellID, p1, p2)
+		return fsChmod(ctx, m, scope, p1, p2)
 	}
 	createTemp := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
-		return fsCreateTemp(ctx, m, cellID, p1, p2, p3, p4)
+		return fsCreateTemp(ctx, m, scope, p1, p2, p3, p4)
 	}
 	mkdirTemp := func(ctx context.Context, m api.Module, p1, p2, p3, p4 uint32) uint32 {
-		return fsMkdirTemp(ctx, m, cellID, p1, p2, p3, p4)
+		return fsMkdirTemp(ctx, m, scope, p1, p2, p3, p4)
 	}
 
 	b.NewFunctionBuilder().WithFunc(read).Export("fs_read")
@@ -595,11 +725,11 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 // cellFS returns the per-cell scoped instance, or false if the cell was
 // never registered (or was torn down). Handlers return code 9 in that
 // case, mirroring the sqlite ext's "no handle" path.
-func cellFS(cellID string) (*scopedFS, bool) {
-	return manager.get(cellID)
+func cellFS(scope ext.Scope) (*scopedFS, bool) {
+	return manager.getScope(scope)
 }
 
-func fsRead(ctx context.Context, m api.Module, cellID string, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsRead(ctx context.Context, m api.Module, scope ext.Scope, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -607,7 +737,7 @@ func fsRead(ctx context.Context, m api.Module, cellID string, pathPtr, pathLen, 
 	if !ok {
 		return 2
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -623,7 +753,7 @@ func fsRead(ctx context.Context, m api.Module, cellID string, pathPtr, pathLen, 
 
 // fsWrite now takes six args: path_ptr, path_len, data_ptr, data_len, req_ptr, req_len.
 // The req buffer carries optional mode via msgpack; absent/zero defaults to 0o644.
-func fsWrite(_ context.Context, m api.Module, cellID string, pathPtr, pathLen, dataPtr, dataLen, reqPtr, reqLen uint32) uint32 {
+func fsWrite(_ context.Context, m api.Module, scope ext.Scope, pathPtr, pathLen, dataPtr, dataLen, reqPtr, reqLen uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -652,7 +782,7 @@ func fsWrite(_ context.Context, m api.Module, cellID string, pathPtr, pathLen, d
 			mode = os.FileMode(req.Mode)
 		}
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -662,7 +792,7 @@ func fsWrite(_ context.Context, m api.Module, cellID string, pathPtr, pathLen, d
 	return 0
 }
 
-func fsDelete(_ context.Context, m api.Module, cellID string, pathPtr, pathLen uint32) uint32 {
+func fsDelete(_ context.Context, m api.Module, scope ext.Scope, pathPtr, pathLen uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -670,7 +800,7 @@ func fsDelete(_ context.Context, m api.Module, cellID string, pathPtr, pathLen u
 	if !ok {
 		return 2
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -683,7 +813,7 @@ func fsDelete(_ context.Context, m api.Module, cellID string, pathPtr, pathLen u
 	return 0
 }
 
-func fsList(ctx context.Context, m api.Module, cellID string, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsList(ctx context.Context, m api.Module, scope ext.Scope, pathPtr, pathLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -691,7 +821,7 @@ func fsList(ctx context.Context, m api.Module, cellID string, pathPtr, pathLen, 
 	if !ok {
 		return 2
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -709,7 +839,7 @@ func fsList(ctx context.Context, m api.Module, cellID string, pathPtr, pathLen, 
 	return writeResponse(ctx, m, encoded, dataPtrOut, dataLenOut)
 }
 
-func fsStat(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsStat(ctx context.Context, m api.Module, scope ext.Scope, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -721,7 +851,7 @@ func fsStat(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, da
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -739,7 +869,7 @@ func fsStat(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, da
 	return writeResponse(ctx, m, encoded, dataPtrOut, dataLenOut)
 }
 
-func fsRename(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
+func fsRename(_ context.Context, m api.Module, scope ext.Scope, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -751,7 +881,7 @@ func fsRename(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uin
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -764,7 +894,7 @@ func fsRename(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uin
 	return 0
 }
 
-func fsRemoveAll(_ context.Context, m api.Module, cellID string, pathPtr, pathLen uint32) uint32 {
+func fsRemoveAll(_ context.Context, m api.Module, scope ext.Scope, pathPtr, pathLen uint32) uint32 {
 	if pathLen == 0 {
 		return 1
 	}
@@ -772,7 +902,7 @@ func fsRemoveAll(_ context.Context, m api.Module, cellID string, pathPtr, pathLe
 	if !ok {
 		return 2
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -782,7 +912,7 @@ func fsRemoveAll(_ context.Context, m api.Module, cellID string, pathPtr, pathLe
 	return 0
 }
 
-func fsMkdirAll(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
+func fsMkdirAll(_ context.Context, m api.Module, scope ext.Scope, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -798,7 +928,7 @@ func fsMkdirAll(_ context.Context, m api.Module, cellID string, reqPtr, reqLen u
 	if req.Mode != 0 {
 		mode = os.FileMode(req.Mode)
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -808,7 +938,7 @@ func fsMkdirAll(_ context.Context, m api.Module, cellID string, reqPtr, reqLen u
 	return 0
 }
 
-func fsChmod(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uint32) uint32 {
+func fsChmod(_ context.Context, m api.Module, scope ext.Scope, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -820,7 +950,7 @@ func fsChmod(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uint
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -833,7 +963,7 @@ func fsChmod(_ context.Context, m api.Module, cellID string, reqPtr, reqLen uint
 	return 0
 }
 
-func fsCreateTemp(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsCreateTemp(ctx context.Context, m api.Module, scope ext.Scope, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -845,7 +975,7 @@ func fsCreateTemp(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
@@ -863,7 +993,7 @@ func fsCreateTemp(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 	return writeResponse(ctx, m, encoded, dataPtrOut, dataLenOut)
 }
 
-func fsMkdirTemp(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
+func fsMkdirTemp(ctx context.Context, m api.Module, scope ext.Scope, reqPtr, reqLen, dataPtrOut, dataLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -875,7 +1005,7 @@ func fsMkdirTemp(ctx context.Context, m api.Module, cellID string, reqPtr, reqLe
 	if err := msgpack.Unmarshal(reqBytes, &req); err != nil {
 		return 3
 	}
-	fs, ok := cellFS(cellID)
+	fs, ok := cellFS(scope)
 	if !ok {
 		return 9
 	}
