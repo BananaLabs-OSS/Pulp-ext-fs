@@ -88,6 +88,7 @@ var manager = newFSManager()
 func init() {
 	ext.Register(ext.Capability{
 		Name:          "storage.fs",
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-fs",
 		Setup:         setup,
 		Teardown:      teardown,
 		TeardownScope: teardownScope,
