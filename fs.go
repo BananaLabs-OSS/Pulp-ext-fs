@@ -74,6 +74,7 @@ type fsApplicationKey struct {
 type fsSetup struct {
 	storageRoot string
 	logger      *slog.Logger
+	grants      ext.PlacementGrantResolver
 }
 
 func newFSManager() *fsManager {
@@ -125,7 +126,7 @@ func (mgr *fsManager) setup(env ext.SetupEnv) error {
 		}
 		return nil
 	}
-	mgr.setups[owner] = fsSetup{storageRoot: env.StorageRoot, logger: logger}
+	mgr.setups[owner] = fsSetup{storageRoot: env.StorageRoot, logger: logger, grants: env.PlacementGrants}
 	if scope.IsLegacy() {
 		mgr.storageRoot = env.StorageRoot
 		mgr.logger = logger
@@ -256,17 +257,46 @@ func (mgr *fsManager) forScope(scope ext.Scope) (*scopedFS, error) {
 	if !scope.IsLegacy() {
 		rootPath = filepath.Join(storageRoot, "apps", scope.ApplicationID(), scope.ApplicationInstanceID(), "cells", scope.CellID(), scope.CellInstanceID())
 	}
-	if ov := fsRootOverrideForScope(scope); ov != "" {
-		rootPath = ov
+	var rights map[string]bool
+	if configured && setup.grants != nil {
+		if grant, ok := setup.grants.ResolvePlacementGrant(scope, "storage.fs"); ok {
+			if grant.Resource != "source" {
+				return nil, fmt.Errorf("storage.fs: unsupported granted resource %q", grant.Resource)
+			}
+			override := strings.TrimSpace(grant.Attributes["root"])
+			if override == "" {
+				return nil, errors.New("storage.fs: scoped grant requires root attribute")
+			}
+			rootPath = override
+			rights = map[string]bool{}
+			for _, right := range grant.Rights {
+				rights[right] = true
+			}
+		}
+	}
+	if rights == nil {
+		if ov := fsRootOverrideForScope(scope); ov != "" {
+			rootPath = ov
+		}
 	}
 	abs, err := filepath.Abs(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root: %w", err)
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
+	if rights != nil {
+		resolved, resolveErr := filepath.EvalSymlinks(abs)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve granted root: %w", resolveErr)
+		}
+		abs = filepath.Clean(resolved)
+		info, statErr := os.Stat(abs)
+		if statErr != nil || !info.IsDir() {
+			return nil, errors.New("storage.fs: granted root must be an existing directory")
+		}
+	} else if err := os.MkdirAll(abs, 0o700); err != nil {
 		return nil, fmt.Errorf("create root: %w", err)
 	}
-	fs := &scopedFS{root: abs}
+	fs := &scopedFS{root: abs, rights: rights}
 	mgr.instances[key] = fs
 	if logger != nil {
 		logger.Info("storage.fs ready", "scope", key, "root", abs)
@@ -340,6 +370,15 @@ func (mgr *fsManager) teardownScope(scope ext.Scope) error {
 
 type scopedFS struct {
 	root string
+	// nil means legacy full access. A non-nil map is an explicit host grant.
+	rights map[string]bool
+}
+
+func (f *scopedFS) require(right string) error {
+	if f.rights != nil && !f.rights[right] {
+		return fmt.Errorf("storage.fs: %s right denied", right)
+	}
+	return nil
 }
 
 type FileEntry struct {
@@ -466,25 +505,43 @@ func (f *scopedFS) checkNoSymlinkEscape(target string) error {
 }
 
 func (f *scopedFS) Read(rel string) ([]byte, error) {
+	if err := f.require("read"); err != nil {
+		return nil, err
+	}
 	abs, err := f.resolve(rel)
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(abs)
+	root, err := os.OpenRoot(f.root)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	name, err := filepath.Rel(f.root, abs)
+	if err != nil {
+		return nil, err
+	}
+	return root.ReadFile(name)
 }
 
 func (f *scopedFS) Write(rel string, data []byte, mode os.FileMode) error {
+	if err := f.require("write"); err != nil {
+		return err
+	}
 	abs, err := f.resolve(rel)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 	return os.WriteFile(abs, data, mode)
 }
 
 func (f *scopedFS) Delete(rel string) error {
+	if err := f.require("delete"); err != nil {
+		return err
+	}
 	abs, err := f.resolve(rel)
 	if err != nil {
 		return err
@@ -493,6 +550,9 @@ func (f *scopedFS) Delete(rel string) error {
 }
 
 func (f *scopedFS) List(rel string) ([]FileEntry, error) {
+	if err := f.require("list"); err != nil {
+		return nil, err
+	}
 	abs, err := f.resolve(rel)
 	if err != nil {
 		return nil, err
@@ -509,6 +569,9 @@ func (f *scopedFS) List(rel string) ([]FileEntry, error) {
 }
 
 func (f *scopedFS) Stat(rel string) (FileInfo, error) {
+	if err := f.require("stat"); err != nil {
+		return FileInfo{}, err
+	}
 	abs, err := f.resolve(rel)
 	if err != nil {
 		return FileInfo{}, err
@@ -527,6 +590,9 @@ func (f *scopedFS) Stat(rel string) (FileInfo, error) {
 }
 
 func (f *scopedFS) Rename(oldRel, newRel string) error {
+	if err := f.require("rename"); err != nil {
+		return err
+	}
 	oldAbs, err := f.resolve(oldRel)
 	if err != nil {
 		return err
@@ -535,13 +601,16 @@ func (f *scopedFS) Rename(oldRel, newRel string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(newAbs), 0o700); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	return os.Rename(oldAbs, newAbs)
+	return atomicReplace(oldAbs, newAbs)
 }
 
 func (f *scopedFS) RemoveAll(rel string) error {
+	if err := f.require("delete"); err != nil {
+		return err
+	}
 	abs, err := f.resolve(rel)
 	if err != nil {
 		return err
@@ -558,6 +627,9 @@ func (f *scopedFS) RemoveAll(rel string) error {
 }
 
 func (f *scopedFS) MkdirAll(rel string, mode os.FileMode) error {
+	if err := f.require("mkdir"); err != nil {
+		return err
+	}
 	abs, err := f.resolve(rel)
 	if err != nil {
 		return err
@@ -566,6 +638,9 @@ func (f *scopedFS) MkdirAll(rel string, mode os.FileMode) error {
 }
 
 func (f *scopedFS) Chmod(rel string, mode os.FileMode) error {
+	if err := f.require("chmod"); err != nil {
+		return err
+	}
 	abs, err := f.resolve(rel)
 	if err != nil {
 		return err
@@ -586,10 +661,13 @@ func (f *scopedFS) relFromRoot(abs string) (string, error) {
 // the resulting path relative to that root. If dir is empty, the default
 // "tmp/" directory under the scoped root is used (and created if missing).
 func (f *scopedFS) CreateTemp(dir, pattern string) (string, error) {
+	if err := f.require("temp"); err != nil {
+		return "", err
+	}
 	var parent string
 	if dir == "" {
 		parent = filepath.Join(f.root, "tmp")
-		if err := os.MkdirAll(parent, 0o755); err != nil {
+		if err := os.MkdirAll(parent, 0o700); err != nil {
 			return "", fmt.Errorf("mkdir tmp: %w", err)
 		}
 		// Apply the same symlink containment the explicit-dir branch gets
@@ -617,10 +695,13 @@ func (f *scopedFS) CreateTemp(dir, pattern string) (string, error) {
 // the resulting path relative to that root. If dir is empty, the default
 // "tmp/" directory under the scoped root is used (and created if missing).
 func (f *scopedFS) MkdirTemp(dir, pattern string) (string, error) {
+	if err := f.require("temp"); err != nil {
+		return "", err
+	}
 	var parent string
 	if dir == "" {
 		parent = filepath.Join(f.root, "tmp")
-		if err := os.MkdirAll(parent, 0o755); err != nil {
+		if err := os.MkdirAll(parent, 0o700); err != nil {
 			return "", fmt.Errorf("mkdir tmp: %w", err)
 		}
 		// Apply the same symlink containment the explicit-dir branch gets
@@ -1037,10 +1118,10 @@ func writeResponse(ctx context.Context, m api.Module, data []byte, ptrOut, lenOu
 		if err != nil || len(results) == 0 {
 			return 7
 		}
-		ptr = uint32(results[0])
-		if ptr == 0 {
+		if results[0] == 0 || results[0] > uint64(^uint32(0)) {
 			return 7
 		}
+		ptr = uint32(results[0]) // #nosec G115 -- upper bound checked above
 		if !m.Memory().Write(ptr, data) {
 			return 8
 		}
@@ -1048,7 +1129,10 @@ func writeResponse(ctx context.Context, m api.Module, data []byte, ptrOut, lenOu
 	if !m.Memory().WriteUint32Le(ptrOut, ptr) {
 		return 8
 	}
-	if !m.Memory().WriteUint32Le(lenOut, uint32(len(data))) {
+	if uint64(len(data)) > uint64(^uint32(0)) {
+		return 8
+	}
+	if !m.Memory().WriteUint32Le(lenOut, uint32(len(data))) { // #nosec G115 -- upper bound checked above
 		return 8
 	}
 	return 0
